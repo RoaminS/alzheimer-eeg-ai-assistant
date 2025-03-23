@@ -1,0 +1,12 @@
+numpy
+pandas
+matplotlib
+seaborn
+tensorflow
+mne
+scikit-learn
+filterpy
+faiss-cpu
+joblib
+tf2onnx
+statsmodels
