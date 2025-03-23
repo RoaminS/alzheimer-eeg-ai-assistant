@@ -10,3 +10,5 @@ faiss-cpu
 joblib
 tf2onnx
 statsmodels
+
+# Si tu es sur GPU, remplace faiss-cpu par faiss-gpu #
