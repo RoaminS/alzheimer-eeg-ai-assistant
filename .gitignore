@@ -1,0 +1,67 @@
+# Environnements Python
+.env
+.venv/
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.pyo
+
+# Fichiers de log / erreurs
+*.log
+*.out
+*.err
+
+# Fichiers Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Données et modèles lourds
+*.h5
+*.hdf5
+*.tflite
+*.onnx
+*.keras
+*.pkl
+*.joblib
+*.npy
+*.npz
+
+# Export PDF, images temporaires
+*.png
+*.jpg
+*.jpeg
+*.pdf
+assets/*.png
+assets/*.jpg
+
+# Données EEG brutes
+*.set
+*.edf
+*.bdf
+*.tsv
+
+# Index FAISS
+*.bin
+
+# Dossiers temporaires
+tmp/
+temp/
+logs/
+__results__/
+
+# Dossiers de build (si compilation future)
+build/
+dist/
+*.egg-info/
+
+# Fichiers système (Mac, Windows)
+.DS_Store
+Thumbs.db
+
+# Sauvegarde d'éditeur
+*.swp
+*.bak
+*.tmp
+
+# Visual Studio Code
+.vscode/
