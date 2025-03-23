@@ -9,12 +9,12 @@ Un projet de recherche autonome, médicalement orienté, utilisant des technolog
 
 ## 🚀 Objectif
 
-> Créer une IA adaptative capable de :
->
-> - Lire les signaux cérébraux EEG
-> - Détecter les stades d’Alzheimer avec précision
-> - Simuler l'activité cérébrale pour entraîner des modèles
-> - Offrir des recommandations de stimulation cognitive personnalisées (VR Alpha, Theta, Delta)
+ Créer une IA adaptative capable de :
+
+ - Lire les signaux cérébraux EEG
+ - Détecter les stades d’Alzheimer avec précision
+ - Simuler l'activité cérébrale pour entraîner des modèles
+ - Offrir des recommandations de stimulation cognitive personnalisées (VR Alpha, Theta, Delta)
 
 ---
 
@@ -87,6 +87,8 @@ cd alzheimer-eeg-ai-assistant
 pip install -r requirements.txt
 ```
 
+---
+
 🔗 Exports
 🧠 Modèle IA disponible au format :
 
@@ -95,6 +97,9 @@ pip install -r requirements.txt
 .onnx (interopérabilité IA)
 
 .tflite (exécution sur terminal embarqué – mobile, casque, etc.)
+
+---
+
 
 🤝 Collaboration
 🎯 Je cherche à collaborer avec :
@@ -110,13 +115,19 @@ Acteurs de la santé numérique et cognitive
 📩 Pour toute proposition ou idée → romainsantoli@gmail.com
 
 📄 Licence
+
+
+---
+
 Ce projet est publié sous la licence Creative Commons BY-NC-SA 4.0.
+
 
 Vous êtes libre de :
 
 ✅ Partager — copier et redistribuer le matériel
 
 ✅ Adapter — remixer, transformer, et créer à partir du matériel
+
 
 Sous conditions :
 
@@ -126,8 +137,11 @@ Sous conditions :
 
 📌 Partage identique — redistribuer les versions modifiées sous la même licence
 
+
 🔗 Lire la licence complète
 
+
+---
 ✨ Crédits
 Ce projet a été développé en autonomie complète par Kocupyr Romain, avec le soutien des IA : Chatgpt & Grok.
 
