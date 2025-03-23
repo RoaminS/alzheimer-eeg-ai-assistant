@@ -8,6 +8,5 @@ scikit-learn>=1.0
 tensorflow>=2.9
 
 
-Optionnel : Si tu utilises une version GPU de TensorFlow, précise :
-
-tensorflow-gpu>=2.9
+#Optionnel : Si tu utilises une version GPU de TensorFlow, précise :
+#tensorflow-gpu>=2.9
