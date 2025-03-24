@@ -31,7 +31,7 @@ Un projet de recherche autonome, médicalement orienté, utilisant des technolog
 
 ---
 
-## 📈 Résultats obtenus
+## 📈 Résultats escomptés
 
 | Indicateur               | Résultat      |
 |--------------------------|---------------|
