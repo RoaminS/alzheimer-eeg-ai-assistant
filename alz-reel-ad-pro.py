@@ -1,4 +1,4 @@
-# alz_reel.py – Modèle IA simplifié de détection Alzheimer via EEG simulé
+# alz-reel-ad-pro.py – Modèle IA simplifié de détection Alzheimer via EEG simulé
 # Auteur : Kocupyr Romain
 # Licence : Creative Commons BY-NC-SA 4.0
 # https://creativecommons.org/licenses/by-nc-sa/4.0/
@@ -13,7 +13,6 @@ import faiss
 import multiprocessing
 import joblib
 import tf2onnx
-from filterpy.kalman import UnscentedKalmanFilter, MerweScaledSigmaPoints
 from scipy.signal import stft
 from tensorflow.keras.models import Model, load_model
 from tensorflow.keras.layers import (Input, Conv1D, MaxPooling1D, LSTM, Dense, Dropout, 
@@ -103,7 +102,7 @@ def sanitize_eeg(eeg_data, verbose=False):
     return eeg_data, too_flat
 
 def compute_spectral_features(data, fs, window_size):
-    """Extraction des fréquences dominantes, band-powers et stabilité."""
+    """Extraction des fréquences dominantes, band-powers et stabilité (via stft scipy)."""
     data, _ = sanitize_eeg(data, verbose=False)
     if data.shape[1] < window_size:
         freqs, _, Zxx = stft(data, fs=fs, nperseg=data.shape[1], noverlap=data.shape[1]//2)
@@ -143,104 +142,322 @@ def compute_inter_channel_correlation(data):
     off_diag = corr_matrix[np.triu_indices_from(corr_matrix, k=1)]
     return np.mean(np.abs(off_diag))
 
-def physical_eeg_model(x, dt, freqs, coupling, band_powers):
-    """Modèle EEG simplifié (équations physiques)."""
-    n_channels = len(x)
-    dx = np.zeros(n_channels)
-    for i in range(n_channels):
-        omega = 2 * np.pi * freqs[i]
-        alpha_power = band_powers[i, 2] / (np.sum(band_powers[i]) + 1e-8)
-        amplitude_mod = np.clip(1 + alpha_power, 0.1, 10)
-        self_term = -omega**2 * np.sin(omega * dt) * x[i] * amplitude_mod
-        coupling_term = coupling * np.mean(x - x[i])
-        dx[i] = self_term + coupling_term
-    return x + dt * dx
+# ---------------------------------------------------------------------------
+# >>> UKF EN TENSORFLOW : Pas d'import filterpy, on réimplémente la logique <<<
+# ---------------------------------------------------------------------------
+@tf.function
+def merwe_params_tf(n, alpha=0.3, beta=2.0, kappa=1.0):
+    """
+    Calcule lambda, Wm, Wc pour le MerweScaledSigmaPoints en mode TensorFlow.
+    """
+    n_float = tf.cast(n, tf.float32)
+    alpha_tf = tf.constant(alpha, dtype=tf.float32)
+    beta_tf = tf.constant(beta, dtype=tf.float32)
+    kappa_tf = tf.constant(kappa, dtype=tf.float32)
 
-def measurement_function(x):
+    lambda_ = alpha_tf**2 * (n_float + kappa_tf) - n_float
+    c = n_float + lambda_
+
+    # Wm / Wc shape = (2n+1,)
+    Wm = tf.fill((2*n+1,), 1.0 / (2.0 * c))
+    Wc = tf.fill((2*n+1,), 1.0 / (2.0 * c))
+
+    # Wm[0] = lambda_/c
+    Wm_0 = lambda_/c
+    # Wc[0] = lambda_/c + (1 - alpha^2 + beta)
+    Wc_0 = lambda_/c + (1.0 - alpha_tf**2 + beta_tf)
+
+    Wm = tf.tensor_scatter_nd_update(Wm, [[0]], [Wm_0])
+    Wc = tf.tensor_scatter_nd_update(Wc, [[0]], [Wc_0])
+    return lambda_, Wm, Wc
+
+@tf.function
+def generate_sigma_points_tf(x, P, alpha=0.3, beta=2.0, kappa=1.0):
+    """
+    Génération vectorisée des sigma points (Merwe) en TensorFlow, 
+    x.shape = (n,), P.shape = (n,n).
+    Retourne un tenseur (2n+1, n).
+    """
+    n = tf.shape(x)[0]
+    lambda_, Wm, Wc = merwe_params_tf(n, alpha, beta, kappa)
+    c = tf.cast(n, tf.float32) + lambda_
+
+    # Décomposition de P * c
+    L = tf.linalg.cholesky(P * c)  # (n, n)
+
+    # On veut x.shape => (1,n) pour broadcast
+    x_expanded = tf.expand_dims(x, axis=0)  # (1,n)
+
+    # plus  => x + L^T
+    # minus => x - L^T
+    # => shape (n, n) chacun
+    L_t = tf.transpose(L)  # (n,n)
+    plus = x_expanded + L_t  # (n,n)
+    minus = x_expanded - L_t  # (n,n)
+
+    # Concaténer dans l'ordre :
+    #  1) x => (1,n)
+    #  2) plus => (n,n)
+    #  3) minus => (n,n)
+    # Final => (2n+1, n)
+    sp0 = x_expanded
+    sigma_points = tf.concat([sp0, plus, minus], axis=0)
+    return sigma_points
+
+@tf.function
+def unscented_transform_tf(Xsigma, Wm, Wc, noise_cov=None):
+    """
+    Applique la transformée unscented : calcule la moyenne et la covariance
+    à partir des sigma points propagés.
+    - Xsigma : (2n+1, n)
+    - Wm, Wc : (2n+1,) weights
+    - noise_cov : (n,n) optionnel
+    Retourne : mean, cov
+    """
+    # Moyenne
+    x_mean = tf.reduce_sum(Xsigma * tf.reshape(Wm, (-1,1)), axis=0)  # (n,)
+
+    # Covariance
+    diff = Xsigma - x_mean  # (2n+1, n)
+    diff_expanded = tf.expand_dims(diff, axis=2)  # (2n+1, n, 1)
+    wc_reshaped = tf.reshape(Wc, (-1,1,1))        # (2n+1, 1, 1)
+
+    cov_terms = wc_reshaped * tf.matmul(diff_expanded, diff_expanded, transpose_b=True)  # (2n+1, n, n)
+    P = tf.reduce_sum(cov_terms, axis=0)  # (n,n)
+
+    if noise_cov is not None:
+        P = P + noise_cov
+    return x_mean, P
+
+@tf.function
+def predict_tf(x, P, Q, dt, fx, alpha=0.3, beta=2.0, kappa=1.0):
+    """
+    Étape de prédiction UKF en TF :
+    - x, P : état et cov courants
+    - Q : covariance bruit process
+    - fx : fonction de transition
+    - Retourne x_pred, P_pred
+    """
+    Xsigma = generate_sigma_points_tf(x, P, alpha, beta, kappa)  # (2n+1, n)
+    # On applique fx à chaque sigma point :
+    Xsigma_pred = tf.map_fn(lambda sp: fx(sp, dt), Xsigma)
+    # On récupère la moy et la cov
+    _, Wm, Wc = merwe_params_tf(tf.shape(x)[0], alpha, beta, kappa)
+    x_pred, P_pred = unscented_transform_tf(Xsigma_pred, Wm, Wc, noise_cov=Q)
+    return x_pred, P_pred, Xsigma_pred
+
+@tf.function
+def update_tf(x_pred, P_pred, z, R, hx, alpha=0.3, beta=2.0, kappa=1.0):
+    """
+    Étape de mise à jour UKF en TF :
+    - x_pred, P_pred : prédiction
+    - z : mesure (n,) en TF
+    - R : covariance bruit de mesure
+    - hx : fonction de mesure (identité ou autre)
+    - Retourne x_new, P_new
+    """
+    # Sigma points sur x_pred
+    Xsigma_pred = generate_sigma_points_tf(x_pred, P_pred, alpha, beta, kappa)  # (2n+1, n)
+    # On projette les sigma points dans l'espace de mesure
+    Zsigma_pred = tf.map_fn(lambda sp: hx(sp), Xsigma_pred)
+    
+    # Moy, Cov sur Z
+    n_meas = tf.shape(z)[0]
+    _, Wm, Wc = merwe_params_tf(n_meas, alpha, beta, kappa)
+    z_mean, Pz = unscented_transform_tf(Zsigma_pred, Wm, Wc, noise_cov=R)
+    
+    # Cross-covariance Pxz
+    diff_x = Xsigma_pred - x_pred
+    diff_z = Zsigma_pred - z_mean
+    wc_reshaped = tf.reshape(Wc, (-1,1,1))  # (2n+1,1,1)
+
+    diff_x_exp = tf.expand_dims(diff_x, axis=2)   # (2n+1, n, 1)
+    diff_z_exp = tf.expand_dims(diff_z, axis=1)   # (2n+1, 1, n)
+    Pxz_terms = wc_reshaped * tf.matmul(diff_x_exp, diff_z_exp)  # (2n+1, n, n)
+    Pxz = tf.reduce_sum(Pxz_terms, axis=0)  # (n,n)
+
+    # Gain
+    Pz_inv = tf.linalg.inv(Pz)  # (n,n)
+    K = tf.matmul(Pxz, Pz_inv)  # (n,n)
+
+    # Mise à jour
+    y = z - z_mean  # (n,)
+    x_new = x_pred + tf.matmul(K, tf.expand_dims(y, axis=1))[:, 0]  # (n,)
+    P_new = P_pred - tf.matmul(K, tf.matmul(Pz, K, transpose_b=True))
+    return x_new, P_new
+
+# ---------------------------------------------------------------------------
+# >>> Fonctions physiques en TensorFlow pour fx / hx
+# ---------------------------------------------------------------------------
+@tf.function
+def physical_eeg_model_tf(x, dt, freqs=None, coupling=None, band_powers=None):
+    """
+    Réplique en TF le physical_eeg_model() (équations simples).
+    x.shape=(n_channels,)
+    """
+    n_channels = tf.shape(x)[0]
+    dx = tf.zeros_like(x)
+
+    # Parcours vectorisé au lieu d'une boucle Python
+    # x => shape (n_channels,)
+    # on calcule self_term[i], coupling_term[i] pour chaque i
+    # gamma[i] = ...
+    # final: dx[i] = ...
+    
+    # freq[i], band_powers[i], etc.
+    # freq[i] => freqs[i]
+    # alpha_power = band_powers[i,2] / sum(band_powers[i])
+    
+    # On profite de tf pour tout vectoriser, si possible.
+    # (Ici, on fera un "map_fn" pour la lisibilité.)
+    
+    def single_channel_update(i):
+        omega = 2.0 * np.pi * freqs[i]
+        sum_bands = tf.reduce_sum(band_powers[i]) + 1e-8
+        alpha_pwr = band_powers[i, 2] / sum_bands
+        amplitude_mod = tf.clip_by_value(1.0 + alpha_pwr, 0.1, 10.0)
+        self_term = -omega**2 * tf.math.sin(omega * dt) * x[i] * amplitude_mod
+        coupling_term = coupling * (tf.reduce_mean(x) - x[i])
+        return self_term + coupling_term
+
+    indices = tf.range(n_channels, dtype=tf.int32)
+    dx_vals = tf.map_fn(single_channel_update, indices, fn_output_signature=tf.float32)
+    # dx_vals shape = (n_channels,)
+    return x + dt * dx_vals
+
+@tf.function
+def measurement_function_tf(x):
+    """
+    hx = identité en TF
+    """
     return x
 
-def ukf_physical_adaptive(eeg_data, fs=500, process_noise_init=0.1, measurement_noise_init=0.1):
+# ---------------------------------------------------------------------------
+# >>>  UKF COMPLET (adaptatif) EN TENSORFLOW  <<<
+# ---------------------------------------------------------------------------
+def ukf_physical_adaptive_tf(eeg_data, fs=500, process_noise_init=0.1, measurement_noise_init=0.1):
     """
-    UKF évolutif (multi-threadé dans la boucle d'appel, pas dans la fonction même).
-    Filtre adaptatif par fenêtres pour le covariance, la stabilité, etc.
+    Variante 100% TensorFlow du UKF adaptatif, exploitant le GPU pour la prédiction/mise à jour.
+    La partie adaptative (calculs de Q, R, etc.) reste en Python / NumPy, mais
+    les étapes UKF (predict/update) sont faites en TensorFlow.
     """
     eeg_data, _ = sanitize_eeg(eeg_data, verbose=False)
     n_channels, n_samples = eeg_data.shape
-    dt = 1 / fs
+    dt = 1.0 / fs
 
-    # Points sigma
-    points = MerweScaledSigmaPoints(n=n_channels, alpha=0.3, beta=2.0, kappa=1.0)
-    # Initialisation UKF
-    ukf = UnscentedKalmanFilter(
-        dim_x=n_channels, dim_z=n_channels, dt=dt,
-        fx=lambda x, dt_local: physical_eeg_model(x, dt_local, freqs_window, coupling_window, band_powers_window),
-        hx=measurement_function, points=points
-    )
-    ukf.x = eeg_data[:, 0].copy()
-    ukf.P = np.eye(n_channels) * process_noise_init
-    
-    # Q/R init
+    # Initialisation x, P
+    x_tf = tf.constant(eeg_data[:, 0], dtype=tf.float32)
+    P_tf = tf.eye(n_channels, dtype=tf.float32) * process_noise_init
+
+    # Q_base, R_base init
     window_init = eeg_data[:, :min(100, n_samples)]
-    Q_base = np.cov(window_init) if window_init.shape[1] > 1 else np.eye(n_channels) * process_noise_init
-    if np.any(np.isnan(Q_base)) or np.any(np.isinf(Q_base)):
-        Q_base = np.eye(n_channels) * process_noise_init
-    R_base = np.eye(n_channels) * measurement_noise_init
-    
-    ukf.Q = Q_base.copy()
-    ukf.R = R_base.copy()
+    if window_init.shape[1] > 1:
+        Q_base_np = np.cov(window_init)
+        if np.any(np.isnan(Q_base_np)) or np.any(np.isinf(Q_base_np)):
+            Q_base_np = np.eye(n_channels) * process_noise_init
+    else:
+        Q_base_np = np.eye(n_channels) * process_noise_init
+
+    R_base_np = np.eye(n_channels) * measurement_noise_init
+
+    Q_base_tf = tf.constant(Q_base_np, dtype=tf.float32)
+    R_base_tf = tf.constant(R_base_np, dtype=tf.float32)
 
     out = np.zeros_like(eeg_data)
-    out[:, 0] = ukf.x
+    out[:, 0] = eeg_data[:, 0]
 
     # Paramètres adaptatifs
     min_window, max_window = 50, 200
     min_coupling, max_coupling = 0.05, 0.2
     window_size = 100
     coupling_window = 0.1
-    freqs_window = np.ones(n_channels) * 10
-    band_powers_window = np.ones((n_channels, 4))
+    freqs_window = np.ones(n_channels, dtype=np.float32) * 10.0
+    band_powers_window = np.ones((n_channels, 4), dtype=np.float32)
 
     for t in range(1, n_samples):
-        z = eeg_data[:, t]
+        z_np = eeg_data[:, t]  # mesure
+        z_tf = tf.constant(z_np, dtype=tf.float32)
+
         window_start = max(0, t - window_size)
         window_data = eeg_data[:, window_start:t]
-        
-        # Mise à jour adaptive toutes les ~1 itérations
+
         if window_data.shape[1] >= 10:
-            stability, freqs_window, band_powers_window = compute_spectral_features(window_data, fs, window_size)
+            # Adaptation par numpy
+            stability, freqs_np, band_powers_np = compute_spectral_features(window_data, fs, window_size)
             window_size = int(min_window + (max_window - min_window) * stability)
             window_size = max(min_window, min(window_size, t))
+
             correlation = compute_inter_channel_correlation(window_data)
             coupling_window = min_coupling + (max_coupling - min_coupling) * correlation
 
-            cov = np.cov(window_data)
-            if np.any(np.isnan(cov)) or np.any(np.isinf(cov)):
-                cov = np.eye(n_channels) * process_noise_init
-            ukf.Q = cov * process_noise_init
+            cov_np = np.cov(window_data)
+            if np.any(np.isnan(cov_np)) or np.any(np.isinf(cov_np)):
+                cov_np = np.eye(n_channels) * process_noise_init
+            Q_tf = tf.constant(cov_np * process_noise_init, dtype=tf.float32)
 
-            z_diff = np.abs(z - ukf.x)
+            z_diff_np = np.abs(z_np - x_tf.numpy())
             std_window = np.std(window_data, axis=1)
             std_window = np.where(std_window < 1e-8, 1e-8, std_window)
-            artifact_factor = np.where(z_diff > 3 * std_window, 10.0, 1.0)
-            ukf.R = R_base * artifact_factor[:, np.newaxis]
-        
-        ukf.predict()
-        ukf.update(z)
-        # Vérification de la validité
-        if np.any(np.isnan(ukf.x)) or np.any(np.isinf(ukf.x)):
-            print(f"⚠️ NaN/Inf dans ukf.x au timestep {t}, réinitialisation")
-            ukf.x, _ = sanitize_eeg(ukf.x, verbose=False)
-        out[:, t] = ukf.x
+            artifact_factor = np.where(z_diff_np > 3 * std_window, 10.0, 1.0)
+            R_adapt_np = R_base_np * artifact_factor[:, np.newaxis]
+            R_tf = tf.constant(R_adapt_np, dtype=tf.float32)
+
+            freqs_window_tf = tf.constant(freqs_np, dtype=tf.float32)
+            band_powers_window_tf = tf.constant(band_powers_np, dtype=tf.float32)
+        else:
+            # Moins de 10 points => Q,R basiques
+            Q_tf = Q_base_tf
+            R_tf = R_base_tf
+            freqs_window_tf = tf.constant(freqs_window, dtype=tf.float32)
+            band_powers_window_tf = tf.constant(band_powers_window, dtype=tf.float32)
+
+        def fx_local(state, dt_local):
+            return physical_eeg_model_tf(
+                state, dt_local,
+                freqs=freqs_window_tf,
+                coupling=tf.constant(coupling_window, dtype=tf.float32),
+                band_powers=band_powers_window_tf
+            )
+
+        def hx_local(state):
+            return measurement_function_tf(state)
+
+        # PREDICTION
+        x_pred, P_pred, _ = predict_tf(x_tf, P_tf, Q_tf, tf.constant(dt, tf.float32), fx_local)
+        # MISE À JOUR
+        x_upd, P_upd = update_tf(x_pred, P_pred, z_tf, R_tf, hx_local)
+
+        x_upd_np = x_upd.numpy()
+        if np.any(np.isnan(x_upd_np)) or np.any(np.isinf(x_upd_np)):
+            print(f"⚠️ NaN/Inf dans x au timestep {t}, réinitialisation")
+            x_upd_np = np.nan_to_num(x_upd_np, nan=0.0, posinf=0.0, neginf=0.0)
+
+        out[:, t] = x_upd_np
+        x_tf = tf.constant(x_upd_np, dtype=tf.float32)
+        P_tf = P_upd
+
+        freqs_window = freqs_window_tf.numpy()
+        band_powers_window = band_powers_window_tf.numpy()
 
     return out
 
 def normalize_eeg(segment):
-    """Standardisation par canal."""
-    segment, _ = sanitize_eeg(segment, verbose=False)
+    """
+    Normalisation du segment EEG :
+    - Remplacement des nan/inf par 0
+    - Vérification si segment vide
+    - Soustraction de la moyenne
+    - Division par l'écart-type (avec std min = 1e-8)
+    - Retour final sans nan/inf
+    """
+    segment = np.nan_to_num(segment, nan=0.0, posinf=0.0, neginf=0.0)
+    if segment.size == 0:
+        return np.zeros_like(segment)
     mean = np.mean(segment, axis=0)
     std = np.std(segment, axis=0)
-    std = np.where(std < 1e-8, 1e-8, std)
-    return (segment - mean) / std
+    std = np.where(std == 0, 1e-8, std)
+    normalized = (segment - mean) / std
+    return np.nan_to_num(normalized, nan=0.0, posinf=0.0, neginf=0.0)
 
 def augment_eeg(segment):
     """Augmentations légères (shift + noise + scale)."""
@@ -266,7 +483,6 @@ def data_generator(X, y, groups, batch_size=64, augment_rare=True):
             X_batch = X[batch_idx].copy()
             y_batch = y[batch_idx]
             if augment_rare:
-                # On applique l'augmentation surtout sur les classes minoritaires
                 for i in range(len(X_batch)):
                     class_label = np.argmax(y_batch[i])
                     if class_label in [1, 2, 3] and np.random.rand() < 0.9:
@@ -286,7 +502,7 @@ def get_label_alzheimer(group, mmse):
     Renvoie une étiquette pour un patient Alzheimer
     Retourne -1 si le patient n'est pas A/AD ou label impossible.
     """
-    # Ici on traite uniquement "A" et "AD"
+    # On traite uniquement "A" et "AD"
     if group not in ["A", "AD"]:
         return -1
 
@@ -308,27 +524,23 @@ def faiss_deduplicate_and_balance(X, y, patient_ids, max_samples=10_000_000, tar
     dim = X_flat.shape[1]
     index = create_or_load_faiss_index(dim, faiss_file, use_gpu, gpu_resources)
     
-    # Chargement éventuel des métadonnées
     if os.path.exists(metadata_file):
         X_existing, y_existing, pids_existing = joblib.load(metadata_file)
         print(f"✅ Métadonnées FAISS chargées depuis {metadata_file} ({len(X_existing)} éléments)")
     else:
         X_existing, y_existing, pids_existing = np.array([]), np.array([]), np.array([])
 
-    # Ajout en batch
     add_to_faiss_index_in_batches(index, X_flat)
     X_combined = np.concatenate([X_existing, X]) if X_existing.size else X
     y_combined = np.concatenate([y_existing, y]) if y_existing.size else y
     pids_combined = np.concatenate([pids_existing, patient_ids]) if pids_existing.size else patient_ids
 
-    # Recherche en batch
     k = 5
     distances, indices = search_faiss_index_in_batches(index, X_flat, k=k)
 
-    # Seuil de proximité pour éliminer les doublons
     seuil_doublon = 0.01
     keep_mask = np.ones(len(X_combined), dtype=bool)
-    offset = len(X_existing)  # Décalage pour aligner sur X_combined
+    offset = len(X_existing)
 
     for i in range(len(X_flat)):
         new_idx = offset + i
@@ -345,7 +557,6 @@ def faiss_deduplicate_and_balance(X, y, patient_ids, max_samples=10_000_000, tar
     pids_dedup = pids_combined[keep_mask]
     print(f"✅ Après déduplication FAISS : {len(X_dedup)} segments restants")
 
-    # Équilibrage par classe
     final_indices = []
     for class_label in range(4):
         class_indices = np.where(y_dedup == class_label)[0]
@@ -359,7 +570,6 @@ def faiss_deduplicate_and_balance(X, y, patient_ids, max_samples=10_000_000, tar
     y_final = y_dedup[final_indices]
     pids_final = pids_dedup[final_indices]
 
-    # Limite globale
     if len(X_final) > max_samples:
         final_indices = np.random.choice(len(X_final), max_samples, replace=False)
         X_final = X_final[final_indices]
@@ -368,7 +578,6 @@ def faiss_deduplicate_and_balance(X, y, patient_ids, max_samples=10_000_000, tar
 
     print(f"✅ Après équilibrage FAISS : {len(X_final)} segments au total")
 
-    # Sauvegarde finale
     if use_gpu and gpu_resources is not None:
         index = faiss.index_gpu_to_cpu(index)
     faiss.write_index(index, faiss_file)
@@ -396,22 +605,19 @@ participants = pd.read_csv(participants_file, sep="\t")
 X_real, y_real, patient_ids = [], [], []
 flat_channels_counter = np.zeros(num_electrodes)
 
-# >>> Traitement patient par patient (A ou AD), mais parallélisation interne sur les segments <<<
-
+# >>> Traitement patient par patient (A ou AD), parallélisation sur les segments <<<
 for sub_dir in os.listdir(data_dir):
     if sub_dir.startswith("sub-"):
         eeg_path = os.path.join(data_dir, sub_dir, "eeg", f"{sub_dir}_task-eyesclosed_eeg.set")
         if os.path.exists(eeg_path):
             try:
                 participant = participants[participants["participant_id"] == sub_dir].iloc[0]
-                # Filtrage strict pour A et AD uniquement
                 if participant["Group"] not in ["A", "AD"]:
                     print(f"ℹ️ Ignoré {sub_dir} (Groupe {participant['Group']} ≠ A/AD)")
                     continue
 
-                # Lecture EEG
                 raw = mne.io.read_raw_eeglab(eeg_path, preload=True)
-                raw.resample(fs)
+                raw.resample(fs)  # "Sampling frequency of the instance is already 500.0, returning unmodified."
                 data_eeg = raw.get_data(picks=raw.ch_names[:num_electrodes])
                 data_eeg, flat_mask = sanitize_eeg(data_eeg, verbose=True)
                 flat_channels_counter += flat_mask.astype(int)
@@ -420,31 +626,30 @@ for sub_dir in os.listdir(data_dir):
                 num_segments = total_samples // samples
                 patient_id = sub_dir
 
-                # Label
                 label_num = get_label_alzheimer(participant["Group"], participant["MMSE"])
                 if label_num == -1:
                     print(f"⚠️ Label invalide pour {sub_dir}, ignoré")
                     continue
 
-                # Préparation des segments
                 segments_data = []
-                valid_indices = []
                 for i in range(num_segments):
                     start = i * samples
                     end = start + samples
                     segment = data_eeg[:, start:end]
-                    # On élimine directement les segments ultra-plats
                     if np.all(np.std(segment, axis=1) < 1e-6):
                         print(f"⚠️ Segment trop plat dans {sub_dir} (segment {i}), ignoré")
                         continue
                     segments_data.append(segment)
-                    valid_indices.append(i)
                 
-                # Filtrage UKF en parallèle (multi-thread sur les segments d'un même patient)
+                def process_segment(seg):
+                    filtered_np = ukf_physical_adaptive_tf(seg, fs=fs, 
+                                                           process_noise_init=0.1,
+                                                           measurement_noise_init=0.1)
+                    return filtered_np
+
                 with ThreadPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
-                    results = list(executor.map(lambda seg: ukf_physical_adaptive(seg, fs=fs), segments_data))
+                    results = list(executor.map(process_segment, segments_data))
                 
-                # Normalisation + stockage
                 for filtered in results:
                     filtered_segment = filtered.T
                     normalized_segment = normalize_eeg(filtered_segment)
@@ -461,19 +666,17 @@ y_real = np.array(y_real)
 patient_ids = np.array(patient_ids)
 print(f"✅ Chargé {len(X_real)} segments réels Alzheimer (A/AD) (de {len(np.unique(patient_ids))} sujets)")
 
-# Visualisation des canaux plats
 plt.figure(figsize=(10, 6))
 sns.barplot(x=list(range(num_electrodes)), y=flat_channels_counter)
 plt.title("Électrodes les plus souvent plates (A/AD uniquement)")
 plt.xlabel("Numéro de l'électrode")
 plt.ylabel("Nombre de détections comme plat")
 plt.savefig(os.path.join(data_dir, "flat_channel_barplot_alzheimer.png"))
-print(f"✅ Barplot des canaux plats sauvegardé sous {os.path.join(data_dir, 'flat_channel_barplot_alzheimer.png')}")
+print(f"✅ Barplot des canaux plats sauvegardé : {os.path.join(data_dir, 'flat_channel_barplot_alzheimer.png')}")
 
 data_file = os.path.join(data_dir, "eeg_data_alzheimer.pkl")
 model_file = os.path.join(data_dir, "alz_model_alzheimer.keras")
 
-# Chargement incrémental si existant
 if os.path.exists(data_file):
     X_loaded, y_loaded, pids_loaded = joblib.load(data_file)
     X = np.concatenate([X_loaded, X_real])
@@ -488,11 +691,8 @@ else:
 # =============================================================================
 #               >>>  Génération de données simulées (4 classes)  <<<
 # =============================================================================
-# (On les conserve pour entraîner un classif multiclasses, si nécessaire)
-
 X_sim, y_sim, pids_sim = [], [], []
 
-# Simulation "Sain" (classe 0)
 alpha_sain, beta_sain = 80, 20
 p_sain = np.random.beta(alpha_sain, beta_sain)
 num_sain = int(len(X_real) * p_sain) if len(X_real) > 0 else 10000
@@ -503,7 +703,6 @@ std_dev = 0.3
 ar_params = [1, -0.5]
 ma_params = [1]
 
-# Simul. classe Sain (0)
 for i in range(num_sain):
     eeg_data = np.zeros((num_electrodes, samples))
     for ch in range(num_electrodes):
@@ -514,15 +713,14 @@ for i in range(num_sain):
             artifact_duration = int(0.2 * fs)
             start_art = np.random.randint(0, samples - artifact_duration)
             eeg_data[ch, start_art:start_art+artifact_duration] += np.sin(
-                2 * np.pi * 50 * np.linspace(0, 0.2, artifact_duration)
+                2*np.pi*50*np.linspace(0, 0.2, artifact_duration)
             )
-    filtered = ukf_physical_adaptive(eeg_data, fs=fs)
-    normed_segment = normalize_eeg(filtered.T)
+    filtered_sim = ukf_physical_adaptive_tf(eeg_data, fs=fs)
+    normed_segment = normalize_eeg(filtered_sim.T)
     X_sim.append(normed_segment)
     y_sim.append(0)
     pids_sim.append(f"sim-sain-{i:06d}")
 
-# Simul. Alzheimer (3 stades)
 class_target_counts = {"Début": 20000, "Modéré": 20000, "Avancé": 20000}
 for progression, count in class_target_counts.items():
     for i in range(count):
@@ -537,19 +735,16 @@ for progression, count in class_target_counts.items():
                 eeg_data[ch, start_art:start_art+artifact_duration] += np.sin(
                     2*np.pi*50*np.linspace(0, 0.2, artifact_duration)
                 )
-        filtered = ukf_physical_adaptive(eeg_data, fs=fs)
-        normed_segment = normalize_eeg(filtered.T)
-        # Indices 1:Début, 2:Modéré, 3:Avancé
+        filtered_sim = ukf_physical_adaptive_tf(eeg_data, fs=fs)
+        normed_segment = normalize_eeg(filtered_sim.T)
         y_sim.append(["Sain", "Début", "Modéré", "Avancé"].index(progression))
         X_sim.append(normed_segment)
         pids_sim.append(f"sim-{progression.lower()}-{i:06d}")
 
-# Concat réel + simulé
 X = np.concatenate([X, np.array(X_sim)])
 y = np.concatenate([y, np.array(y_sim)])
 patient_ids = np.concatenate([patient_ids, np.array(pids_sim)])
 
-# Déduplication + équilibrage FAISS
 X, y, patient_ids = faiss_deduplicate_and_balance(
     X, y, patient_ids, max_samples=max_samples, target_per_class=20000, 
     faiss_file=faiss_file, metadata_file=metadata_file, 
@@ -572,7 +767,6 @@ def attention_block(inputs, name_suffix=""):
     out = Multiply()([inputs, att])
     return out
 
-# Architecture CNN + LSTM Bi + Attention
 input_layer = Input(shape=(samples, num_electrodes))
 x = Conv1D(128, kernel_size=3, activation='relu', padding='same')(input_layer)
 x = BatchNormalization()(x)
@@ -593,6 +787,7 @@ clf = Model(inputs=input_layer, outputs=output_layer)
 optimizer = Adam(learning_rate=0.001)
 clf.compile(optimizer=optimizer, loss=CategoricalFocalCrossentropy(gamma=6), metrics=['accuracy'])
 
+model_file = os.path.join(data_dir, "alz_model_alzheimer.keras")
 if os.path.exists(model_file):
     try:
         old_model = load_model(model_file, compile=False)
@@ -604,7 +799,6 @@ if os.path.exists(model_file):
 else:
     print("✅ Nouveau modèle initialisé")
 
-# Split Train/Test
 gss = GroupShuffleSplit(n_splits=1, test_size=0.3, random_state=42)
 train_idx, test_idx = next(gss.split(X, y, groups=patient_ids))
 
@@ -612,7 +806,6 @@ X_train_raw, X_test_raw = X[train_idx], X[test_idx]
 y_train_raw, y_test_raw = y_onehot[train_idx], y_onehot[test_idx]
 pids_train, pids_test = patient_ids[train_idx], patient_ids[test_idx]
 
-# Split Validation
 gss_val = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
 train_idx2, val_idx = next(gss_val.split(X_train_raw, y_train_raw, groups=pids_train))
 
@@ -649,13 +842,8 @@ history = clf.fit(
     verbose=1
 )
 
-# Rechargement du meilleur modèle
 clf = load_model(model_file, compile=False)
 clf.compile(optimizer=optimizer, loss=CategoricalFocalCrossentropy(gamma=6), metrics=['accuracy'])
-
-# =============================================================================
-#                     >>>  Évaluation & Visualisations  <<<
-# =============================================================================
 
 test_gen = data_generator_eval(X_test_raw, y_test_raw, pids_test, batch_size=batch_size)
 y_pred_all, y_test_all, pids_test_all = [], [], []
@@ -678,14 +866,12 @@ y_true_classes = np.argmax(y_test_onehot, axis=1)
 uncertain_cases = np.max(y_pred, axis=1) < 0.5
 print(f"✅ Cas incertains détectés : {np.sum(uncertain_cases)} segments (proba max < 0.5)")
 
-# Agrégation par patient
 patient_preds = defaultdict(list)
 for pid, pred_class in zip(pids_test_array, y_pred_classes):
     patient_preds[pid].append(pred_class)
 patient_results = {pid: Counter(preds).most_common(1)[0][0] for pid, preds in patient_preds.items()}
 
 def get_patient_label(pid):
-    """Récupère le label patient pour la comparaison (données réelles ou sims)."""
     if pid.startswith("sub-"):
         row = participants[participants["participant_id"] == pid].iloc[0]
         return get_label_alzheimer(row["Group"], row["MMSE"])
@@ -737,7 +923,7 @@ plt.ylabel("Vraies classes")
 plt.xticks(ticks=[0, 1, 2, 3], labels=["Sain", "Début", "Modéré", "Avancé"])
 plt.yticks(ticks=[0, 1, 2, 3], labels=["Sain", "Début", "Modéré", "Avancé"])
 plt.savefig(os.path.join(data_dir, "alz_confusion_matrix_patient_alzheimer.png"))
-print(f"✅ Matrice de confusion sauvegardée sous {os.path.join(data_dir, 'alz_confusion_matrix_patient_alzheimer.png')}")
+print(f"✅ Matrice de confusion sauvegardée : {os.path.join(data_dir, 'alz_confusion_matrix_patient_alzheimer.png')}")
 
 plt.figure(figsize=(10, 6))
 max_probs = np.max(y_pred, axis=1)
@@ -747,14 +933,12 @@ plt.xlabel("Probabilité maximale")
 plt.ylabel("Nombre de prédictions")
 plt.grid(True, alpha=0.3)
 plt.savefig(os.path.join(data_dir, "probability_histogram_alzheimer.png"))
-print(f"✅ Histogramme des probabilités sauvegardé sous {os.path.join(data_dir, 'probability_histogram_alzheimer.png')}")
+print(f"✅ Histogramme des probabilités sauvegardé : {os.path.join(data_dir, 'probability_histogram_alzheimer.png')}")
 
-# Export ONNX
 onnx_file = os.path.join(data_dir, "alz_model_alzheimer.onnx")
 model_proto, _ = tf2onnx.convert.from_keras(clf, output_path=onnx_file)
 print(f"✅ Modèle exporté en ONNX sous {onnx_file}")
 
-# Export TFLite
 tflite_file = os.path.join(data_dir, "alz_model_alzheimer.tflite")
 converter = tf.lite.TFLiteConverter.from_keras_model(clf)
 tflite_model = converter.convert()
@@ -766,7 +950,7 @@ print(f"✅ Modèle exporté en TFLite sous {tflite_file}")
 # ------------------------------------------------------------------------------
 # 📄 LICENCE - Creative Commons Attribution-NonCommercial-ShareAlike 4.0
 #
-# Ce script "alz_reel.py" fait partie du projet Alzheimer EEG AI Assistant,
+# Ce script "alz-reel-ad-pro.py" fait partie du projet Alzheimer EEG AI Assistant,
 # développé par Kocupyr Romain (romainsantoli@gmail.com).
 #
 # Vous êtes libres de :
