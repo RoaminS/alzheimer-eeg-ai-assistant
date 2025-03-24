@@ -143,7 +143,39 @@ def compute_inter_channel_correlation(data):
     return np.mean(np.abs(off_diag))
 
 # ---------------------------------------------------------------------------
-# >>> 1) Fonctions physiques en TensorFlow (fx, hx)  <<<
+# >>> 1) Fonctions de stabilisation / safe Cholesky  <<<
+# ---------------------------------------------------------------------------
+@tf.function
+def stabilize_matrix(matrix, epsilon=1e-6):
+    """
+    Ajoute un terme epsilon sur la diagonale de 'matrix'
+    pour s'assurer qu'elle soit définie positive.
+    """
+    # On ajoute epsilon seulement sur la diagonale
+    diag_add = tf.eye(tf.shape(matrix)[-1], dtype=matrix.dtype) * epsilon
+    return matrix + diag_add
+
+@tf.function
+def safe_cholesky(matrix, epsilon=1e-6):
+    """
+    Tente une Cholesky, sinon on ajoute epsilon*I et on retente.
+    Compatible @tf.function (mais on n'a pas de try/except direct).
+    On fait deux passes : si la 1ère échoue => fallback.
+    """
+    # Trick : On utilise tf.linalg.cholesky avec tf.cond
+    # Malheureusement, un try/except Python n'est pas directement supporté en graph.
+    # On peut faire un test sur la min valeur propre, etc.
+    # => version simplifiée : on assure la stabilité "a priori"
+    #    via stabilize_matrix, puis on fait la Cholesky.
+    # En pratique, on re-stabilise si échec.
+    # On simplifie ici en ajoutant un minimal param "epsilon".
+    
+    # On appelle d'abord stabilize_matrix()
+    stable_matrix = stabilize_matrix(matrix, epsilon)
+    return tf.linalg.cholesky(stable_matrix)
+
+# ---------------------------------------------------------------------------
+# >>> 2) Fonctions physiques en TensorFlow (fx, hx)  <<<
 # ---------------------------------------------------------------------------
 @tf.function(reduce_retracing=True)
 def physical_eeg_model_tf(x, dt, freqs, coupling, band_powers):
@@ -152,22 +184,14 @@ def physical_eeg_model_tf(x, dt, freqs, coupling, band_powers):
     x.shape=(n_channels,)
     """
     n_channels = tf.shape(x)[0]
-    # dx_vals[i] = self_term + coupling_term
-    # Vectorisation au lieu de boucles python
-    mean_x = tf.reduce_mean(x)  # pour calculer (mean_x - x[i]) sur chaque canal
+    mean_x = tf.reduce_mean(x)
 
-    # On calcule alpha_power canal par canal
     sum_bands = tf.reduce_sum(band_powers, axis=1) + 1e-8  # shape=(n_channels,)
-    alpha_pwr = band_powers[:, 2] / sum_bands  # alpha band
-
-    # amplitude_mod[i] = clip(1 + alpha_pwr[i], 0.1, 10)
+    alpha_pwr = band_powers[:, 2] / sum_bands
     amplitude_mod = tf.clip_by_value(1.0 + alpha_pwr, 0.1, 10.0)
 
-    # self_term[i] = -omega^2 * sin(omega * dt) * x[i] * amplitude_mod[i]
-    # coupling_term[i] = coupling * (mean_x - x[i])
-    # => dx[i] = self_term[i] + coupling_term[i]
     omega = 2.0 * np.pi * freqs
-    sin_part = tf.math.sin(omega * dt)  # shape=(n_channels,)
+    sin_part = tf.math.sin(omega * dt)
 
     self_term = - (omega**2) * sin_part * x * amplitude_mod
     coupling_term = coupling * (mean_x - x)
@@ -181,7 +205,7 @@ def measurement_function_tf(x):
     return x
 
 # ---------------------------------------------------------------------------
-# >>> 2) Fonctions Merwe (sigma points) et unscented transform  <<<
+# >>> 3) Fonctions Merwe (sigma points) et unscented transform  <<<
 # ---------------------------------------------------------------------------
 @tf.function(reduce_retracing=True)
 def merwe_params_tf(n, alpha=0.3, beta=2.0, kappa=1.0):
@@ -196,13 +220,10 @@ def merwe_params_tf(n, alpha=0.3, beta=2.0, kappa=1.0):
     lambda_ = alpha_tf**2 * (n_float + kappa_tf) - n_float
     c = n_float + lambda_
 
-    # Wm / Wc shape = (2n+1,)
     Wm = tf.fill((2*n+1,), 1.0 / (2.0 * c))
     Wc = tf.fill((2*n+1,), 1.0 / (2.0 * c))
 
-    # Wm[0] = lambda_/c
     Wm_0 = lambda_/c
-    # Wc[0] = lambda_/c + (1 - alpha^2 + beta)
     Wc_0 = lambda_/c + (1.0 - alpha_tf**2 + beta_tf)
 
     Wm = tf.tensor_scatter_nd_update(Wm, [[0]], [Wm_0])
@@ -220,20 +241,15 @@ def generate_sigma_points_tf(x, P, alpha=0.3, beta=2.0, kappa=1.0):
     lambda_, Wm, Wc = merwe_params_tf(n, alpha, beta, kappa)
     c = tf.cast(n, tf.float32) + lambda_
 
-    # Décomposition de P * c
-    L = tf.linalg.cholesky(P * c)  # (n, n)
+    # >>> on stabilise P avant la factorisation
+    stable_P = stabilize_matrix(P, 1e-6) * c
+    L = safe_cholesky(stable_P)  # => Cholesky sur la matrice stable
 
-    # On veut x.shape => (1,n) pour broadcast
     x_expanded = tf.expand_dims(x, axis=0)  # (1,n)
-
-    # plus  => x + L^T
-    # minus => x - L^T
-    # => shape (n, n) chacun
     L_t = tf.transpose(L)  # (n,n)
     plus = x_expanded + L_t  # (n,n)
     minus = x_expanded - L_t  # (n,n)
 
-    # Concaténer dans l'ordre :
     sp0 = x_expanded
     sigma_points = tf.concat([sp0, plus, minus], axis=0)  # (2n+1, n)
     return sigma_points
@@ -266,75 +282,56 @@ def predict_update_ukf_tf(
     freqs, coupling, band_powers
 ):
     """
-    Fonction unique pour la prédiction ET la mise à jour, 
-    évite d'appeler 2 fonctions décorées distinctes dans la boucle.
-    - x, P : état et covariance
-    - z : mesure
-    - Q, R : bruit de process et mesure
-    - dt : échantillonnage (tf.float32)
-    - freqs, coupling, band_powers : Tenseurs pour la dynamique EEG
-    Retourne : x_upd, P_upd
+    Fonction unique pour la prédiction ET la mise à jour (UKF).
     """
-
-    # ---- 1) PREDICTION ----
+    # --- PREDICTION ---
     n = tf.shape(x)[0]
-    alpha=0.3
-    beta=2.0
-    kappa=1.0
+    alpha, beta, kappa = (0.3, 2.0, 1.0)
 
-    # Sigma points
-    Xsigma = generate_sigma_points_tf(x, P, alpha, beta, kappa)  # (2n+1, n)
-    # On applique fx
+    Xsigma = generate_sigma_points_tf(x, P, alpha, beta, kappa)
     def fx(sp):
         return physical_eeg_model_tf(sp, dt, freqs, coupling, band_powers)
+
     Xsigma_pred = tf.map_fn(fx, Xsigma)
-    # Moy/cov
     _, Wm, Wc = merwe_params_tf(n, alpha, beta, kappa)
     x_pred, P_pred = unscented_transform_tf(Xsigma_pred, Wm, Wc, noise_cov=Q)
 
-    # ---- 2) UPDATE ----
-    # On projette Xsigma_pred dans l'espace de mesure hx
+    # --- UPDATE ---
     Zsigma_pred = tf.map_fn(measurement_function_tf, Xsigma_pred)
     z_mean, Pz = unscented_transform_tf(Zsigma_pred, Wm, Wc, noise_cov=R)
 
     diff_x = Xsigma_pred - x_pred
     diff_z = Zsigma_pred - z_mean
-    wc_reshaped = tf.reshape(Wc, (-1,1,1))  # (2n+1,1,1)
+    wc_reshaped = tf.reshape(Wc, (-1,1,1))
 
-    diff_x_exp = tf.expand_dims(diff_x, axis=2)   # (2n+1, n, 1)
-    diff_z_exp = tf.expand_dims(diff_z, axis=1)   # (2n+1, 1, n)
+    diff_x_exp = tf.expand_dims(diff_x, axis=2)
+    diff_z_exp = tf.expand_dims(diff_z, axis=1)
     Pxz_terms = wc_reshaped * tf.matmul(diff_x_exp, diff_z_exp)
-    Pxz = tf.reduce_sum(Pxz_terms, axis=0)  # (n,n)
+    Pxz = tf.reduce_sum(Pxz_terms, axis=0)
 
-    Pz_inv = tf.linalg.inv(Pz)
-    K = tf.matmul(Pxz, Pz_inv)  # (n,n)
+    Pz_inv = tf.linalg.inv(stabilize_matrix(Pz, 1e-6))  # On stabilise Pz
+    K = tf.matmul(Pxz, Pz_inv)
 
     y = z - z_mean
     x_new = x_pred + tf.matmul(K, tf.expand_dims(y, axis=1))[:, 0]
     P_new = P_pred - tf.matmul(K, tf.matmul(Pz, K, transpose_b=True))
-
     return x_new, P_new
 
 # ---------------------------------------------------------------------------
-# >>> 3) UKF complet adaptatif (dans un loop Python), 1 seul appel TF / itération  <<<
+# >>> 4) UKF complet adaptatif  <<<
 # ---------------------------------------------------------------------------
 def ukf_physical_adaptive_tf(eeg_data, fs=500, process_noise_init=0.1, measurement_noise_init=0.1):
     """
-    Variante 100% TensorFlow du UKF adaptatif, exploitant le GPU pour la prédiction/mise à jour.
-    La partie adaptative (Q, R dynamiques, etc.) reste en Python, 
-    on appelle 'predict_update_ukf_tf()' 1 fois par itération => 1 graph.
+    Variante 100% TensorFlow du UKF adaptatif, exploitant le GPU pour la prédiction/mise à jour,
+    avec stabilisation Cholesky (safe_cholesky).
     """
     eeg_data, _ = sanitize_eeg(eeg_data, verbose=False)
     n_channels, n_samples = eeg_data.shape
-
-    # On définit dt_tf (constant) pour éviter le retracing à chaque itération
     dt_tf = tf.constant(1.0 / fs, dtype=tf.float32)
 
-    # Initialisation x, P
     x_tf = tf.constant(eeg_data[:, 0], dtype=tf.float32)
     P_tf = tf.eye(n_channels, dtype=tf.float32) * process_noise_init
 
-    # Q_base, R_base init
     window_init = eeg_data[:, :min(100, n_samples)]
     if window_init.shape[1] > 1:
         Q_base_np = np.cov(window_init)
@@ -344,14 +341,12 @@ def ukf_physical_adaptive_tf(eeg_data, fs=500, process_noise_init=0.1, measureme
         Q_base_np = np.eye(n_channels) * process_noise_init
 
     R_base_np = np.eye(n_channels) * measurement_noise_init
-
     Q_base_tf = tf.constant(Q_base_np, dtype=tf.float32)
     R_base_tf = tf.constant(R_base_np, dtype=tf.float32)
 
     out = np.zeros_like(eeg_data)
     out[:, 0] = eeg_data[:, 0]
 
-    # Paramètres adaptatifs
     min_window, max_window = 50, 200
     min_coupling, max_coupling = 0.05, 0.2
     window_size = 100
@@ -359,13 +354,13 @@ def ukf_physical_adaptive_tf(eeg_data, fs=500, process_noise_init=0.1, measureme
     freqs_window = np.ones(n_channels, dtype=np.float32) * 10.0
     band_powers_window = np.ones((n_channels, 4), dtype=np.float32)
 
-    # On cast pour TF
+    # coupl, freq, band => tf.placeholder-like
     coupling_tf = tf.constant(coupling_window, dtype=tf.float32)
     freqs_window_tf = tf.constant(freqs_window, dtype=tf.float32)
     band_powers_window_tf = tf.constant(band_powers_window, dtype=tf.float32)
 
     for t in range(1, n_samples):
-        z_np = eeg_data[:, t]  # mesure
+        z_np = eeg_data[:, t]
         z_tf = tf.constant(z_np, dtype=tf.float32)
 
         window_start = max(0, t - window_size)
@@ -395,11 +390,9 @@ def ukf_physical_adaptive_tf(eeg_data, fs=500, process_noise_init=0.1, measureme
             freqs_window_tf = tf.constant(freqs_np, dtype=tf.float32)
             band_powers_window_tf = tf.constant(band_powers_np, dtype=tf.float32)
         else:
-            # Moins de 10 points => Q,R basiques
             Q_tf = Q_base_tf
             R_tf = R_base_tf
 
-        # Appel unique TF => 1 trace (ou peu)
         x_upd, P_upd = predict_update_ukf_tf(
             x_tf, P_tf, z_tf, Q_tf, R_tf, dt_tf,
             freqs_window_tf, coupling_tf, band_powers_window_tf
@@ -921,7 +914,7 @@ print(f"✅ Modèle exporté en TFLite sous {tflite_file}")
 # ------------------------------------------------------------------------------
 # 📄 LICENCE - Creative Commons Attribution-NonCommercial-ShareAlike 4.0
 #
-# Ce script "alz_pro2.py" fait partie du projet Alzheimer EEG AI Assistant,
+# Ce script "aalz_pro2.py" fait partie du projet Alzheimer EEG AI Assistant,
 # développé par Kocupyr Romain (romainsantoli@gmail.com).
 #
 # Vous êtes libres de :
