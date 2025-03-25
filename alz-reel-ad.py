@@ -1,5 +1,5 @@
  """
-alz_reel.py – Modèle IA simplifié de détection Alzheimer via EEG simulé
+alz-reel-ad.py – Modèle IA simplifié de détection Alzheimer via EEG simulé
 
 Auteur : Kocupyr Romain
 Licence : Creative Commons BY-NC-SA 4.0
