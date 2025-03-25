@@ -1,5 +1,5 @@
 """
-alz_reel.py – Modèle IA simplifié de détection Alzheimer via EEG simulé
+alz_simfull.py – Modèle IA simplifié de détection Alzheimer via EEG simulé
 
 Auteur : Kocupyr Romain
 Licence : Creative Commons BY-NC-SA 4.0
@@ -466,7 +466,7 @@ print(f"✅ Export TFLite → {tflite_file}")
 # ------------------------------------------------------------------------------
 # 📄 LICENCE - Creative Commons Attribution-NonCommercial-ShareAlike 4.0
 #
-# Ce script "alz_reel.py" fait partie du projet Alzheimer EEG AI Assistant,
+# Ce script "alz_simfull.py" fait partie du projet Alzheimer EEG AI Assistant,
 # développé par Kocupyr Romain (romainsantoli@gmail.com).
 #
 # Vous êtes libres de :
