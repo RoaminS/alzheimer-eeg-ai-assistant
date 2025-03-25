@@ -670,7 +670,7 @@ print(f"✅ Modèle exporté en TFLite sous {tflite_file}")
 # ------------------------------------------------------------------------------
 # 📄 LICENCE - Creative Commons Attribution-NonCommercial-ShareAlike 4.0
 #
-# Ce script "alz_reel.py" fait partie du projet Alzheimer EEG AI Assistant,
+# Ce script "alz-reel-ad.py" fait partie du projet Alzheimer EEG AI Assistant,
 # développé par Kocupyr Romain (romainsantoli@gmail.com).
 #
 # Vous êtes libres de :
