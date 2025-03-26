@@ -7,6 +7,8 @@
 Le rendre executable: 
 chmod +x /chemin/dossier/run_predict.sh
 
+Puis pour l'executer: (être dans le bon dossier :) )
+./run_predict.sh
 
 Licence : Creative Commons BY-NC-SA 4.0
 Auteurs : Kocupyr Romain créateur et chef de projet, dev = GPT multi_gpt_api (OpenAI), Grok3, kocupyr romain
