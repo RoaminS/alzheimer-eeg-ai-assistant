@@ -69,17 +69,15 @@ print(f"✅ Figure 2B sauvegardée : connectivity_graph_{LABEL}.png")
 
 
 
-
-
-# ------------------------------------------------------------------------------
+ # ------------------------------------------------------------------------------
 # 📄 LICENCE - Creative Commons Attribution-NonCommercial-ShareAlike 4.0
 #
-# Ce script "plot_brain_connectivity.py" fait partie du projet Alzheimer EEG AI Assistant,
+# Ce script "adformer_hybrid_voting_full.py" fait partie du projet Alzheimer EEG AI Assistant,
 # développé par Kocupyr Romain (rkocupyr@gmail.com).
 #
 # Vous êtes libres de :
-# ✅ Partager — copier et redistribuer le script
-# ✅ Adapter — le modifier, transformer et l’intégrer dans un autre projet
+# ✅ Partager — copier le script
+# ✅ Adapter — le modifier et l’intégrer dans un autre projet
 #
 # Sous les conditions suivantes :
 # 📌 Attribution — Vous devez mentionner l’auteur original (Kocupyr Romain)
