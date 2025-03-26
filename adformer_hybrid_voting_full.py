@@ -1,8 +1,13 @@
 """
 ADFormer-HYBRID — EEG Alzheimer Classifier (Full Pipeline, Stable Version)
 Licence : Creative Commons BY-NC-SA 4.0
-Auteurs : Kocupyr Romain, GPT multi_gpt_api (OpenAI), Grok3
+Auteurs : Kocupyr Romain créateur et chef de projet, dev = GPT multi_gpt_api (OpenAI), Grok3, kocupyr romain
+Dataset = https://www.kaggle.com/datasets/yosftag/open-nuro-dataset
 Accu: EPOCH 30 = 92.84%
+F1 Macro = 98,63%
+Précision patient-level = 98,45%
+Evaluate script = evaluate_adformer_subject.py
+Evaluate patient = run_predict.py
 """
 
 import os
