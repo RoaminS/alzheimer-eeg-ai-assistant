@@ -727,3 +727,887 @@ if __name__ == "__main__":
 #
 # 🔗 Licence complète : https://creativecommons.org/licenses/by-nc-sa/4.0/
 # ------------------------------------------------------------------------------ 
+
+
+-----------------------------------
+
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+ADFormer-HYBRID — EEG Alzheimer Classifier (Two-Pipeline Version + Kalman & Oversampling)
+Licence : Creative Commons BY-NC-SA 4.0
+Auteurs : 
+    - Kocupyr Romain (créateur et chef de projet) : rkocupyr@gmail.com
+    - Dev = GPT multi_gpt_api (OpenAI)
+    - Grok3
+Dataset = https://www.kaggle.com/datasets/yosftag/open-nuro-dataset
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import h5py
+import mne
+import joblib
+from scipy.signal import welch
+from scipy.stats import iqr
+from pykalman import KalmanFilter
+import antropy as ant
+from sklearn.preprocessing import StandardScaler
+from statsmodels.tsa.arima_process import ArmaProcess
+import faiss
+import random
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+from collections import defaultdict, Counter
+from sklearn.metrics import (
+    f1_score, accuracy_score, confusion_matrix, 
+    recall_score
+)
+from sklearn.svm import SVC
+
+# ====================================================================================
+# === PARAMÈTRES GLOBAUX
+# ====================================================================================
+fs = 128               # Fréquence d'échantillonnage
+samples = 512          # Taille (en échantillons) de chaque segment EEG
+num_electrodes = 19    # Nombre d'électrodes utilisées
+
+# Taille du "brut" (512 × 19) et des features
+RAW_SIZE = samples * num_electrodes   # 512 * 19 = 9728
+FEATURE_SIZE = 267                    # Taille du vecteur retourné par extract_features()
+TOTAL_SIZE = RAW_SIZE + FEATURE_SIZE  # 9728 + 267 = 9995
+
+# Paires d’asymétrie utilisées
+asym_pairs = [(3, 5), (13, 15), (0, 1)]
+
+# Modèle de Kalman pour le lissage
+kf_model = KalmanFilter(initial_state_mean=0, n_dim_obs=1)
+
+# Bandes de fréquences EEG pour l’extraction spectrale
+bands = {
+    'Delta': (0.5, 4),
+    'Theta': (4, 8),
+    'Alpha1': (8, 10),
+    'Alpha2': (10, 13),
+    'Beta1': (13, 20),
+    'Beta2': (20, 30),
+    'Gamma': (30, 45)
+}
+
+# Hyperparamètres ADFormer binaire
+patch_len = 64
+n_patches = samples // patch_len  # 512 // 64 = 8
+input_dim = patch_len * num_electrodes  # 64×19 = 1216
+num_classes_binary = 2
+
+# Appareil
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# ====================================================================================
+# === FONCTIONS DIVERSES
+# ====================================================================================
+def kalman_filter_signal(signal_1d):
+    """
+    Applique un filtre de Kalman sur un signal 1D (dans l'idée de le lisser).
+    signal_1d : array [T,]
+    Retourne un array [T,] filtré.
+    """
+    filtered, _ = kf_model.filter(signal_1d[:, None])
+    return filtered[:, 0]
+
+
+def generate_arima_eeg(mean, std, samples=512):
+    """
+    Génère un signal EEG fictif par un processus ARIMA
+    (ex: AR=1, MA=0.5) autour d'une moyenne/std spécifiées.
+    """
+    ar_params = np.array([1, -0.5])
+    ma_params = np.array([1])
+    return mean + std * ArmaProcess(ar_params, ma_params).generate_sample(nsample=samples)
+
+
+def replicate_data(X, y, target=1466):
+    """
+    Effectue un oversampling basique (aléatoire) jusqu'à obtenir 'target' échantillons.
+    X : array (N, d)
+    y : array (N,)
+    """
+    if len(X) >= target:
+        return X, y  # pas besoin d'oversampler
+    new_X, new_y = [], []
+    while len(new_X) < target:
+        idx = random.randrange(len(X))
+        new_X.append(X[idx])
+        new_y.append(y[idx])
+    return np.array(new_X), np.array(new_y)
+
+
+# ====================================================================================
+# === EXTRACTION DE FEATURES
+# ====================================================================================
+def extract_spectral_features(psd, freqs):
+    """
+    Extrait et filtre (Kalman) les features spectrales pour chaque bande.
+    Retourne un vecteur 7×19 = 133 + 2×7=14 pour kalman_means/diffs = 147
+    """
+    num_electrodes = psd.shape[1]
+    band_feats = []
+    kalman_means = []
+    kalman_diffs = []
+
+    # On va distinguer la moyenne brute de chaque bande + la version filtrée
+    # par Kalman sur l’axe des fréquences, puis on calcule la "mean" de la partie filtrée.
+    for fmin, fmax in bands.values():
+        idx = (freqs >= fmin) & (freqs <= fmax)
+        if np.sum(idx) == 0:
+            # Bande vide
+            band_feats.append(np.zeros(num_electrodes))
+            kalman_means.append(0.0)
+            kalman_diffs.append(0.0)
+            continue
+
+        raw_power = np.mean(psd[idx], axis=0)  # shape = (19,)
+        # Filtrage Kalman sur la moyenne spectrale *fréquence par fréquence*
+        # On a un "signal" sur la zone idx (somme freq).
+        # On va faire la moyenne sur l'axe electrodes => psd[idx].mean(axis=1)
+        # et l’appliquer sur raw_power moyen. Déjà fait en code "classique".
+        # => On fusionne la logique initiale :
+        k_signal = psd[idx].mean(axis=1)  # => shape (nb_freqs_in_band,)
+        k_filtered = kalman_filter_signal(k_signal)
+        k_power_mean = np.mean(k_filtered)
+
+        # On ajoute un "diff" = (moyenne brute - moyenne filtrée)
+        power_diff = raw_power.mean() - k_power_mean
+
+        # On peut lisser (optionnel) le "raw_power" par electrode aussi,
+        # mais on dispose seulement de 19 valeurs (electrodes). On va l'appliquer
+        # électrode par électrode comme si "19" = dimension "temporelle",
+        # (un peu arbitraire mais répond au besoin "filtrage léger")
+        # pour clarifier la "séparation" spectrale.
+        for e in range(num_electrodes):
+            raw_power[e] = kalman_filter_signal(np.array([raw_power[e]]))[0]
+            # NB: Sur 1 point, c'est discutable, on peut l'omettre ; on laisse
+            # car la consigne l'exige. Cela aura peu d'effet.
+
+        band_feats.append(raw_power)
+        kalman_means.append(k_power_mean)
+        kalman_diffs.append(power_diff)
+
+    rbp = np.stack(band_feats, axis=0)  # shape (7, 19)
+
+    # Concatène : [ 7×19 + 7 + 7 ] = 133 + 14 = 147
+    feats_spectral = np.concatenate([rbp.flatten(), kalman_means, kalman_diffs])
+    return feats_spectral
+
+
+def extract_entropy_features(data):
+    """
+    Calcule la perm_en et sample_en (19 canaux), puis applique un
+    petit filtrage Kalman (opération symbolique) pour lisser.
+    Retourne un vecteur de taille 38 (19 + 19).
+    """
+    num_electrodes = data.shape[1]
+
+    perm_en = np.array([
+        ant.perm_entropy(data[:, i], order=3, normalize=True)
+        for i in range(num_electrodes)
+    ])
+    sample_en = np.array([
+        ant.sample_entropy(data[:, i], order=2)
+        for i in range(num_electrodes)
+    ])
+
+    # Filtrage "Kalman" canal par canal, en traitant
+    # la dimension "19" comme pseudo-temporelle (arbitraire).
+    # On va le faire globalement:
+    perm_en_k = kalman_filter_signal(perm_en)
+    sample_en_k = kalman_filter_signal(sample_en)
+
+    # On renvoie la version "filtrée" pour chaque canal
+    return np.concatenate([perm_en_k, sample_en_k])
+
+
+def extract_features(data):
+    """
+    Calcule un vecteur final de 267 features pour un segment (512,19).
+    Séparation explicite en blocs (spectral / entropic / connectivité / stats).
+    Et on applique de petits filtrages Kalman sur la partie spectro/entropique.
+    """
+    if data.shape != (samples, num_electrodes):
+        raise ValueError(f"❌ Segment shape invalide : {data.shape}")
+
+    try:
+        # === Statistiques temporelles (57)
+        mean_t = np.mean(data, axis=0)
+        var_t = np.var(data, axis=0)
+        iqr_t = iqr(data, axis=0)
+
+        # === PSD
+        freqs, psd = welch(data, fs=fs, nperseg=samples, axis=0)
+        feats_spectral = extract_spectral_features(psd, freqs)  # (147)
+
+        # === Entropies
+        feats_entropy = extract_entropy_features(data)  # (38)
+
+        # === Connectivité (corrélation, clustering, efficiency, etc.)
+        corr_matrix = np.corrcoef(data.T)
+        clustering = np.array([
+            np.sum(corr_matrix[i] > 0.5) / (num_electrodes - 1)
+            for i in range(num_electrodes)
+        ])
+        path_length = np.mean(np.abs(corr_matrix))
+        non_zero_corr = corr_matrix[np.abs(corr_matrix) > 0]
+        efficiency = (np.mean(1/np.abs(non_zero_corr)) 
+                      if len(non_zero_corr) > 0 else 0.0)
+        small_worldness = (np.mean(clustering)/path_length 
+                           if path_length != 0 else 0.0)
+
+        # === Asymétries (3)
+        asym = np.array([
+            np.mean(data[:, i] - data[:, j]) for i, j in asym_pairs
+        ])
+
+        # On concatène : 
+        #   stats temporelles (3×19=57) 
+        # + feats_spectral (147)
+        # + feats_entropy (38)
+        # + clustering (19)
+        # + asym (3)
+        # + path_length, efficiency, small_worldness (3)
+        final_vector = np.concatenate([
+            mean_t, var_t, iqr_t,            # 57
+            feats_spectral,                  # 147
+            feats_entropy,                   # 38
+            clustering,                      # 19
+            asym,                            # 3
+            [path_length, efficiency, small_worldness]  # 3
+        ])
+
+        if final_vector.shape[0] != FEATURE_SIZE:
+            raise ValueError(f"❌ Mauvais nb de features. Attendu {FEATURE_SIZE}, obtenu {final_vector.shape[0]}")
+
+        return final_vector
+
+    except Exception as e:
+        print(f"❌ Erreur dans extract_features : {e}")
+        return np.array([])  # On ignore ce segment en cas de pb
+
+
+# ====================================================================================
+# === LABELING
+# ====================================================================================
+def get_labels(row):
+    """
+    Renvoie un tuple (y_main, y_stage).
+    - y_main : classe binaire
+        0 => non-AD (Group = 'A')
+        1 => AD (Group = 'AD')
+        -1 => si hors scope
+    - y_stage : si AD, renvoie 1/2/3 selon la sévérité ; sinon -1
+    """
+    if row["Group"] not in ["A", "AD"]:
+        return -1, -1  # Hors scope
+
+    # Binaire
+    y_main = 0 if row["Group"] == "A" else 1
+
+    # Stade basé sur le MMSE (uniquement si AD)
+    if y_main == 0:
+        return y_main, -1
+
+    mmse = row["MMSE"]
+    if pd.isna(mmse):
+        return y_main, 1
+    elif mmse >= 19:
+        return y_main, 1
+    elif mmse >= 10:
+        return y_main, 2
+    else:
+        return y_main, 3
+
+
+# ====================================================================================
+# === CONSTRUCTION DATASET
+# ====================================================================================
+def build_dataset_with_sim(data_dir, out_file):
+    """
+    Construit et sauvegarde en HDF5 un dataset équilibré (classe binaire AD vs non-AD).
+    - Parcourt les EEG existants, extrait tous les segments valides (512×19).
+    - Calcule 267 features (avec séparation spectro/entro + Kalman).
+    - Concatène (raw + features) -> vecteur de taille 9995.
+    - Stocke y_main et y_stage.
+    - Complète avec des signaux ARIMA pour équilibrer AD vs non-AD.
+    - Déduplication via FAISS.
+    - Sauvegarde X, y_main et y_stage dans 'out_file'.
+    """
+    participants = pd.read_csv(os.path.join(data_dir, "participants.tsv"), sep="\t")
+    subjects = participants[participants["Group"].isin(["A", "AD"])]
+
+    X, y_main_list, y_stage_list = [], [], []
+
+    for _, row in subjects.iterrows():
+        pid = row["participant_id"]
+        y_main, y_stage = get_labels(row)
+        if y_main == -1:
+            continue  # hors scope
+
+        eeg_path = os.path.join(data_dir, pid, "eeg", f"{pid}_task-eyesclosed_eeg.set")
+        print(f"🔍 Vérification: {pid} | y_main={y_main} | y_stage={y_stage} | Fichier: {eeg_path}")
+
+        if not os.path.exists(eeg_path):
+            print(f"⚠️ Fichier manquant : {eeg_path}")
+            continue
+
+        try:
+            raw = mne.io.read_raw_eeglab(eeg_path, preload=True, verbose=False)
+            # Filtrage + resample
+            raw.filter(0.5, 45)
+            raw.resample(fs)
+            data = raw.get_data(picks=raw.ch_names[:num_electrodes], units="uV").T
+            print(f"✅ EEG chargé : {data.shape}")
+
+            nb_valid = 0
+            # Découpe l'EEG en segments de 512 points
+            total_segments = data.shape[0] // samples
+            for i in range(total_segments):
+                segment = data[i*samples : (i+1)*samples]
+                if segment.shape != (samples, num_electrodes):
+                    continue
+
+                # Calcul des features
+                feat = extract_features(segment)
+                if feat.shape[0] != FEATURE_SIZE:
+                    # vecteur de features invalide
+                    continue
+
+                # Concatène RAW (9728) + features (267) = 9995
+                raw_vec = segment.flatten()  # shape (9728,)
+                full_vec = np.concatenate([raw_vec, feat])
+                if full_vec.shape[0] != TOTAL_SIZE:
+                    print("❌ Problème de taille lors de la concaténation.")
+                    continue
+
+                X.append(full_vec)
+                y_main_list.append(y_main)
+                y_stage_list.append(y_stage)
+                nb_valid += 1
+
+            print(f"✅ {pid} : {nb_valid} segments valides extraits")
+
+        except Exception as e:
+            print(f"❌ Erreur lecture {pid} : {e}")
+            continue
+
+    print(f"📊 Total segments extraits (EEG réel) : {len(X)}")
+
+    if len(X) == 0:
+        raise RuntimeError("❌ Aucun segment valide n'a été extrait. Vérifier les données.")
+
+    # Équilibrage binaire via simulation EEG (ARIMA)
+    counter_main = Counter(y_main_list)
+    target_per_class = max(counter_main.values())
+    print("Équilibrage binaire AD vs non-AD...")
+    for label_bin in [0, 1]:
+        current_count = counter_main.get(label_bin, 0)
+        missing = target_per_class - current_count
+        if missing > 0:
+            # Génère des segments artificiels
+            mean_val = 0.5 if label_bin == 0 else 2.0
+            for _ in range(missing):
+                eeg_sim = np.array([
+                    generate_arima_eeg(mean_val, 0.3, samples=samples)
+                    for _ in range(num_electrodes)
+                ]).T  # shape (512,19)
+
+                feat_sim = extract_features(eeg_sim)
+                if feat_sim.shape[0] == FEATURE_SIZE:
+                    raw_vec = eeg_sim.flatten()
+                    full_vec = np.concatenate([raw_vec, feat_sim])
+                    if full_vec.shape[0] == TOTAL_SIZE:
+                        X.append(full_vec)
+                        y_main_list.append(label_bin)
+                        if label_bin == 1:
+                            y_stage_list.append(2)  # stade fictif
+                        else:
+                            y_stage_list.append(-1)
+
+    print(f"✅ Dataset équilibré total (binaire) : {len(X)}")
+
+    # Déduplication via FAISS
+    X = np.array(X).astype(np.float32)
+    y_main_array = np.array(y_main_list)
+    y_stage_array = np.array(y_stage_list)
+
+    dim = X.shape[1]
+    index = faiss.IndexFlatL2(dim)
+    index.add(X)
+    D, I = index.search(X, 2)
+    mask = D[:, 1] > 1e-5
+    X_clean = X[mask]
+    y_main_clean = y_main_array[mask]
+    y_stage_clean = y_stage_array[mask]
+
+    print(f"✅ Déduplication FAISS : {len(X_clean)} segments restants")
+
+    # Sauvegarde HDF5
+    with h5py.File(out_file, 'w') as f:
+        f.create_dataset("X", data=X_clean)
+        f.create_dataset("y_main", data=y_main_clean)
+        f.create_dataset("y_stage", data=y_stage_clean)
+
+    meta_info = {
+        'counter_main': dict(Counter(y_main_clean)),
+        'counter_stage': dict(Counter(y_stage_clean))
+    }
+    joblib.dump(meta_info, out_file.replace('.h5', '_meta.pkl'))
+    print(f"💾 Sauvegardé : {out_file}")
+
+
+# ====================================================================================
+# === DATASET BINARIE
+# ====================================================================================
+class EEGDatasetBinary(Dataset):
+    """
+    Dataset pour la classification binaire (AD vs non-AD).
+    """
+    def __init__(self, h5_path):
+        with h5py.File(h5_path, 'r') as f:
+            self.X = np.array(f['X'])           # shape [N, 9995]
+            self.y_main = np.array(f['y_main']) # 0 ou 1
+        # StandardScaler sur TOUTES les colonnes
+        self.scaler = StandardScaler().fit(self.X)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        """
+        Renvoie (patches, features, label).
+        - patches : (n_patches, input_dim) => ex (8, 1216)
+        - features : (267,)
+        - label : 0 ou 1
+        """
+        flat = self.X[idx]
+        label = int(self.y_main[idx])
+        flat_normed = self.scaler.transform([flat])[0]
+
+        eeg_raw = flat_normed[:RAW_SIZE].reshape(samples, num_electrodes)
+        eeg_raw = (eeg_raw - eeg_raw.mean(0)) / (eeg_raw.std(0) + 1e-6)
+        patch = eeg_raw.reshape(n_patches, patch_len, num_electrodes)
+        patch = patch.transpose(0, 2, 1).reshape(n_patches, -1)
+        patch_t = torch.tensor(patch, dtype=torch.float32)
+
+        feat_t = torch.tensor(flat_normed[RAW_SIZE:], dtype=torch.float32)
+        return patch_t, feat_t, torch.tensor(label, dtype=torch.long)
+
+
+# ====================================================================================
+# === MODÈLE BINARIE (ADFormer + SVM)
+# ====================================================================================
+class ADFormerBinary(nn.Module):
+    """
+    ADFormer pour la classification binaire (AD vs non-AD).
+    - TransformerEncoder sur les patches
+    - Fusion avec features (MLP)
+    - Tête de classification (2 classes)
+    """
+    def __init__(self, patch_dim=input_dim, d_model=256, num_layers=4, heads=4):
+        super().__init__()
+        self.embed = nn.Linear(patch_dim, d_model)
+        self.pos = nn.Parameter(torch.randn(1, n_patches, d_model))
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, 
+            nhead=heads, 
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        self.feature_proj = nn.Sequential(
+            nn.LayerNorm(267),
+            nn.Linear(267, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model)
+        )
+
+        self.head = nn.Sequential(
+            nn.LayerNorm(d_model * 2),
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, num_classes_binary)
+        )
+
+    def forward(self, patch, feat):
+        x = self.embed(patch) + self.pos
+        x = self.transformer(x)[:, -1]  # token final
+        f = self.feature_proj(feat)
+        fusion = torch.cat([x, f], dim=1)
+        return self.head(fusion)
+
+
+def train_adformer_binary(h5_file, epochs=10):
+    """
+    Entraîne le modèle ADFormerBinary + SVM (fusion) pour AD vs non-AD.
+    """
+    ds = EEGDatasetBinary(h5_file)
+    loader = DataLoader(ds, batch_size=64, shuffle=True)
+
+    model = ADFormerBinary().to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=2e-4)
+    loss_fn = nn.CrossEntropyLoss()
+
+    # SVM sur les 267 features (binaire)
+    X_svm = ds.X[:, RAW_SIZE:]
+    y_svm = ds.y_main
+    svm = SVC(probability=True, kernel='rbf')
+    print("Entraînement SVM (267 dims) [Binaire]...")
+    svm.fit(X_svm, y_svm)
+    print("✅ SVM binaire prêt")
+
+    for epoch in range(1, epochs+1):
+        model.train()
+        total_loss, correct = 0, 0
+        for patch, feat, y in tqdm(loader, desc=f"[Binaire] Epoch {epoch}/{epochs}"):
+            patch, feat, y = patch.to(device), feat.to(device), y.to(device)
+            logits = model(patch, feat)
+
+            prob_net = F.softmax(logits, dim=1)
+            svm_probs = svm.predict_proba(feat.cpu().numpy())
+            svm_probs_t = torch.tensor(svm_probs, device=device, dtype=torch.float32)
+            fused = (prob_net + svm_probs_t) / 2
+
+            # CrossEntropy sur la log des probas fusionnées
+            loss = loss_fn(torch.log(fused), y)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+            total_loss += loss.item()
+            correct += (fused.argmax(dim=1) == y).sum().item()
+
+        acc = correct / len(ds)
+        print(f"✅ [Binaire] Epoch {epoch} | Loss: {total_loss:.4f} | Acc: {acc*100:.2f}%")
+
+    os.makedirs("ad_models", exist_ok=True)
+    torch.save(model.state_dict(), "ad_models/adformer_binary.pth")
+    joblib.dump(svm, "ad_models/svm_binary.pkl")
+    joblib.dump(ds.scaler, "ad_models/scaler_binary.pkl")
+    print("✅ Modèles enregistrés (Réseau binaire + SVM + Scaler).")
+
+
+# ====================================================================================
+# === DATASET STAGING
+# ====================================================================================
+class EEGDatasetStaging(Dataset):
+    """
+    Dataset pour le staging (1/2/3) uniquement AD.
+    Utilise seulement les 267 features et un oversampling à 1466 si nécessaire.
+    """
+    def __init__(self, h5_path):
+        with h5py.File(h5_path, 'r') as f:
+            X_full = np.array(f['X'])
+            y_main = np.array(f['y_main'])
+            y_stage = np.array(f['y_stage'])
+
+        # Ne garder que AD + y_stage in [1,2,3]
+        mask_ad = (y_main == 1) & (y_stage > 0)
+        X_feat = X_full[mask_ad, RAW_SIZE:]  
+        y_st = y_stage[mask_ad] - 1  # => 0/1/2
+
+        # Oversampling à 1466
+        X_feat_os, y_st_os = replicate_data(X_feat, y_st, target=1466)
+        self.X_feat = X_feat_os
+        self.y_stage = y_st_os
+
+        self.scaler = StandardScaler().fit(self.X_feat)
+
+    def __len__(self):
+        return len(self.X_feat)
+
+    def __getitem__(self, idx):
+        xfeat = self.X_feat[idx]
+        y = self.y_stage[idx]
+        x_norm = self.scaler.transform([xfeat])[0]
+        return torch.tensor(x_norm, dtype=torch.float32), torch.tensor(y, dtype=torch.long)
+
+
+# ====================================================================================
+# === MODÈLE STAGING
+# ====================================================================================
+class StageNet(nn.Module):
+    """
+    MLP simple pour classifier les stades (1/2/3 => 0/1/2).
+    """
+    def __init__(self, input_dim=267, hidden=128, num_classes=3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, num_classes)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+def train_stage_network(h5_file, epochs=10):
+    """
+    Entraîne le MLP StageNet pour distinguer 3 stades, sur AD uniquement.
+    """
+    ds_stage = EEGDatasetStaging(h5_file)
+    loader_stage = DataLoader(ds_stage, batch_size=64, shuffle=True)
+
+    model_s = StageNet().to(device)
+    opt = torch.optim.Adam(model_s.parameters(), lr=1e-3)
+    loss_fn = nn.CrossEntropyLoss()
+
+    for epoch in range(1, epochs+1):
+        model_s.train()
+        total_loss, correct = 0, 0
+        for xfeat, y in tqdm(loader_stage, desc=f"[Staging] Epoch {epoch}/{epochs}"):
+            xfeat, y = xfeat.to(device), y.to(device)
+            logits = model_s(xfeat)
+            loss = loss_fn(logits, y)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+            total_loss += loss.item()
+            correct += (logits.argmax(dim=1) == y).sum().item()
+
+        acc = correct / len(ds_stage)
+        print(f"✅ [Staging] Epoch {epoch} | Loss: {total_loss:.4f} | Acc: {acc*100:.2f}%")
+
+    torch.save(model_s.state_dict(), "ad_models/stagenet.pth")
+    joblib.dump(ds_stage.scaler, "ad_models/scaler_stage.pkl")
+    print("✅ Modèle de staging enregistré (StageNet + scaler).")
+
+
+# ====================================================================================
+# === MAIN
+# ====================================================================================
+if __name__ == "__main__":
+    # 1) Build dataset si besoin
+    if not os.path.exists("eeg_data_balanced.h5"):
+        print("⚠️ EEG HDF5 manquant, génération en cours...")
+        build_dataset_with_sim("alz", "eeg_data_balanced.h5")
+    assert os.path.exists("eeg_data_balanced.h5"), "❌ Le fichier .h5 est manquant !"
+
+    # 2) Entraînement binaire
+    if not os.path.exists("ad_models/adformer_binary.pth"):
+        train_adformer_binary("eeg_data_balanced.h5", epochs=10)
+
+    # 3) Entraînement staging
+    if not os.path.exists("ad_models/stagenet.pth"):
+        train_stage_network("eeg_data_balanced.h5", epochs=10)
+
+    # =========================
+    # Exemple d'inférence
+    # =========================
+    print("\n=== Démonstration d'inférence sur l'ensemble du dataset ===")
+
+    # Rechargement binaire
+    model_bin = ADFormerBinary().to(device)
+    model_bin.load_state_dict(torch.load("ad_models/adformer_binary.pth", map_location=device))
+    model_bin.eval()
+
+    svm_bin = joblib.load("ad_models/svm_binary.pkl")
+    scaler_bin = joblib.load("ad_models/scaler_binary.pkl")
+
+    # Rechargement staging
+    model_stage = StageNet().to(device)
+    model_stage.load_state_dict(torch.load("ad_models/stagenet.pth", map_location=device))
+    model_stage.eval()
+
+    scaler_stage = joblib.load("ad_models/scaler_stage.pkl")
+
+    # Chargement du dataset complet
+    with h5py.File("eeg_data_balanced.h5", "r") as f:
+        X_all = np.array(f['X'])
+        y_main_all = np.array(f['y_main'])
+        y_stage_all = np.array(f['y_stage'])
+
+    # On crée des IDs factices (5 segments = 1 "sujet" arbitraire, par ex.)
+    subject_ids = [f"{label}_{i//5}" for i, label in enumerate(y_main_all)]
+    results_main = defaultdict(list)
+    results_stage = defaultdict(list)
+
+    for i, x in enumerate(X_all):
+        sid = subject_ids[i]
+        true_main = y_main_all[i]   # 0 ou 1
+        true_stage = y_stage_all[i] # 1..3 ou -1
+
+        # ================
+        # 1) Classification binaire
+        # ================
+        x_norm = scaler_bin.transform([x])[0]
+
+        # Patches + features
+        eeg_raw = x_norm[:RAW_SIZE].reshape(samples, num_electrodes)
+        eeg_raw = (eeg_raw - eeg_raw.mean(0)) / (eeg_raw.std(0) + 1e-6)
+        patch = eeg_raw.reshape(n_patches, patch_len, num_electrodes)
+        patch = patch.transpose(0,2,1).reshape(n_patches, -1)
+        patch_t = torch.tensor(patch, dtype=torch.float32).unsqueeze(0).to(device)
+
+        feat_bin = x_norm[RAW_SIZE:]
+        feat_bin_t = torch.tensor(feat_bin, dtype=torch.float32).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            logits_bin = model_bin(patch_t, feat_bin_t)
+            prob_net_bin = F.softmax(logits_bin, dim=1).cpu().numpy()[0]   # ex: [0.3, 0.7]
+            prob_svm_bin = svm_bin.predict_proba(feat_bin.reshape(1, -1))[0]  # ex: [0.4, 0.6]
+            fused_bin = (prob_net_bin + prob_svm_bin) / 2                 # ex: [0.35, 0.65]
+
+        # Confiance
+        pred_bin = np.argmax(fused_bin)
+        confidence_bin = fused_bin[pred_bin]
+        if confidence_bin < 0.6:
+            # Rejet => on met la classe à -1
+            pred_bin = -1
+
+        results_main[sid].append(pred_bin)
+
+        # ================
+        # 2) Staging si AD (et confiance >= 0.6)
+        # ================
+        if pred_bin == 1:
+            # Normalisation staging
+            x_feat_stage = x[RAW_SIZE:]  
+            x_feat_stage_norm = scaler_stage.transform([x_feat_stage])[0]
+            x_feat_stage_t = torch.tensor(x_feat_stage_norm, dtype=torch.float32).unsqueeze(0).to(device)
+
+            with torch.no_grad():
+                logits_stage = model_stage(x_feat_stage_t)
+                prob_stage = F.softmax(logits_stage, dim=1).cpu().numpy()[0]  # ex: shape (3,)
+            st_pred = np.argmax(prob_stage)
+            conf_stage = prob_stage[st_pred]
+            # On pourrait ajouter un seuil confidence_stage si souhaité
+            if conf_stage < 0.6:
+                # Rejet staging
+                st_pred = -1
+            results_stage[sid].append(st_pred)
+        else:
+            # non-AD => on ne fait pas de staging
+            results_stage[sid].append(-1)
+
+
+    # =======================
+    # Vote par sujet
+    # =======================
+    final_main_true, final_main_pred = [], []
+    final_stage_true, final_stage_pred = [], []
+    rejected_main = []
+    rejected_stage = []
+
+    for sid, preds_main in results_main.items():
+        # Binaire : si tout est -1 => rejet
+        if all(p == -1 for p in preds_main):
+            # tout rejet
+            vote_main = -1
+            rejected_main.append(sid)
+        else:
+            valid_preds = [p for p in preds_main if p != -1]
+            if len(valid_preds) == 0:
+                # tout rejet
+                vote_main = -1
+                rejected_main.append(sid)
+            else:
+                vote_main = Counter(valid_preds).most_common(1)[0][0]
+
+        # Vrai label
+        idx_ex = int(sid.split("_")[-1]) * 5
+        true_m = y_main_all[idx_ex]
+        final_main_true.append(true_m)
+        final_main_pred.append(vote_main)
+
+        # Staging
+        if vote_main == 1:
+            st_preds = results_stage[sid]
+            # si tout -1 => rejet
+            if all(s == -1 for s in st_preds):
+                st_vote = -1
+                rejected_stage.append(sid)
+            else:
+                valid_st = [s for s in st_preds if s != -1]
+                st_vote = Counter(valid_st).most_common(1)[0][0]
+            true_st = y_stage_all[idx_ex]
+            final_stage_true.append(true_st)
+            final_stage_pred.append(st_vote)
+        else:
+            final_stage_true.append(-1)
+            final_stage_pred.append(-1)
+
+
+    # =======================
+    # Évaluations
+    # =======================
+    # Binaire
+    bin_mask_valid = [p != -1 for p in final_main_pred]
+    y_true_bin = np.array(final_main_true)[bin_mask_valid]
+    y_pred_bin = np.array(final_main_pred)[bin_mask_valid]
+    if len(y_true_bin) > 0:
+        acc_bin = accuracy_score(y_true_bin, y_pred_bin)
+        f1_bin = f1_score(y_true_bin, y_pred_bin, average="macro")
+        cm_bin = confusion_matrix(y_true_bin, y_pred_bin)
+        print("\n=== Résultats Classification Binaire (Sujet) ===")
+        print(f"Accuracy binaire (hors rejets) : {acc_bin*100:.2f}%")
+        print(f"F1 Macro binaire (hors rejets) : {f1_bin*100:.2f}%")
+        print("Matrice de confusion binaire (hors rejets) :\n", cm_bin)
+    else:
+        print("\nAucun sujet binaire classé (tous rejetés).")
+
+    # Staging
+    # On ne regarde que ceux dont y_main=1 (vraie étiquette) => AD
+    # et dont vote_main=1 => On compare y_stage
+    st_mask = [(tm==1) and (pm==1) for tm, pm in zip(final_main_true, final_main_pred)]
+    st_true = np.array(final_stage_true)[st_mask]
+    st_pred = np.array(final_stage_pred)[st_mask]
+    # on retire ceux qui ont -1 => rejets
+    valid_st_idx = (st_pred != -1)
+    st_true_val = st_true[valid_st_idx]
+    st_pred_val = st_pred[valid_st_idx]
+    if len(st_true_val) > 0:
+        acc_st = accuracy_score(st_true_val, st_pred_val)
+        f1_st = f1_score(st_true_val, st_pred_val, average="macro")
+        cm_st = confusion_matrix(st_true_val, st_pred_val)
+        print("\n=== Résultats Staging (Sujet AD) ===")
+        print(f"Accuracy staging (hors rejets) : {acc_st*100:.2f}%")
+        print(f"F1 Macro staging (hors rejets) : {f1_st*100:.2f}%")
+        print("Matrice de confusion staging (hors rejets) :\n", cm_st)
+    else:
+        print("\nAucun sujet AD classé en staging (tous rejetés).")
+
+    print(f"\n❌ Nombre de sujets rejetés (binaire) : {len(rejected_main)}")
+    print(f"❌ Nombre de sujets rejetés (staging) : {len(rejected_stage)}")
+
+
+# ------------------------------------------------------------------------------
+# 📄 LICENCE - Creative Commons Attribution-NonCommercial-ShareAlike 4.0
+# 
+# Ce script "ADFormer-HYBRID (Two-Pipeline Version + Kalman & Oversampling)"
+# fait partie du projet Alzheimer EEG AI Assistant, développé par Kocupyr Romain.
+# Contact : rkocupyr@gmail.com
+#
+# Vous êtes libres de :
+#   ✅ Partager — copier le script
+#   ✅ Adapter — le modifier et l’intégrer dans un autre projet
+#
+# Sous les conditions suivantes :
+#   📌 Attribution — Vous devez mentionner l’auteur original (Kocupyr Romain)
+#   📌 Non Commercial — Interdiction d’usage commercial sans autorisation
+#   📌 Partage identique — Toute version modifiée doit être publiée sous la même licence
+#
+# 🔗 Licence complète : https://creativecommons.org/licenses/by-nc-sa/4.0/
+# ------------------------------------------------------------------------------
+
